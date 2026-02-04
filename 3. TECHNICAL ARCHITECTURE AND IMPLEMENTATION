@@ -1,0 +1,1014 @@
+COMPREHENSIVE TECHNICAL ARCHITECTURE & IMPLEMENTATION: HYBRID PHOTONIC-ELECTRONIC AI ACCELERATOR
+
+ARCHITECTURE OVERVIEW: PHOENIX-1 ACCELERATOR
+
+1. System Specifications
+
+· Target: Data center inference accelerator for Transformer models
+· Precision: 4-bit activations, 8-bit weights (training-aware quantization)
+· Peak Performance: 256 TOPS (at 4-bit)
+· Energy Efficiency: 100 TOPS/W (optical MAC operations only)
+· Technology Node: 7nm CMOS + 220nm SOI photonics
+· Package: 2.5D silicon interposer with HBM3 memory
+
+---
+
+2. HARDWARE ARCHITECTURE
+
+2.1 Chiplet-Based System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                             SYSTEM-ON-INTERPOSER                        │
+├─────────────┬─────────────┬─────────────┬────────────────┬─────────────┤
+│ PHOTONIC    │ ELECTRONIC  │ ELECTRONIC  │ HBM3           │ PHOTONIC    │
+│ COMPUTE     │ CONTROL &   │ ACTIVATION  │ MEMORY         │ I/O         │
+│ CHIPLET     │ MEMORY      │ CHIPLET     │ STACK (4x)     │ CHIPLET     │
+│ (8×8 Array) │ CHIPLET     │ (4×4 Array) │                │             │
+└─────────────┴─────────────┴─────────────┴────────────────┴─────────────┘
+                              │              │
+                         ┌────┴────┐   ┌────┴────┐
+                         │ SILICON │   │ OPTICAL │
+                         │INTERPOSER│   │ COUPLERS│
+                         └──────────┘   └─────────┘
+```
+
+2.2 Photonic Compute Chiplet Architecture
+
+Die Size: 5mm × 5mm
+Component Count:
+
+· 64×64 MZI mesh with 4,096 phase shifters
+· 64 wavelength-division multiplexing (WDM) channels
+· 512 germanium photodetectors
+· 256 silicon modulators
+· 64 micro-heaters with PID controllers
+
+Physical Layout:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    PHOTONIC CHIPLET                  │
+├─────────────────┬─────────────────┬─────────────────┤
+│ INPUT MODULATOR │ MZI COMPUTE     │ OUTPUT          │
+│ ARRAY           │ MESH            │ DETECTOR ARRAY  │
+│                 │                 │                 │
+│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │
+│ │ 256 Si      │ │ │ 64×64 MZI   │ │ │ 512 Ge      │ │
+│ │ Modulators  │ │ │ Mesh (4,096 │ │ │ Photodiodes │ │
+│ │ @ 50 Gbps   │ │ │ Phase Shift │ │ │ + TIAs      │ │
+│ │ + Drivers   │ │ │ Shifters)   │ │ │             │ │
+│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │
+│                 │                 │                 │
+│ 64 WDM Channels │ 64 Temp Sensors │ 64 ADCs (8-bit) │
+│ 4 Lasers @      │ 64 Heaters      │ @ 20 GSps       │
+│ 16λ each        │ (PID Control)   │                 │
+└─────────────────┴─────────────────┴─────────────────┘
+```
+
+2.3 MZI Mesh Implementation Details
+
+MZI Unit Cell Design:
+
+```verilog
+// MZI Phase Shifter Control
+module mzi_phase_controller (
+    input wire clk,
+    input wire reset_n,
+    input wire [11:0] target_phase,  // 12-bit phase resolution
+    output reg [7:0] heater_pwm,
+    output reg phase_locked
+);
+    // PID Controller Parameters
+    parameter KP = 8'h20;  // Proportional gain
+    parameter KI = 8'h04;  // Integral gain  
+    parameter KD = 8'h10;  // Derivative gain
+    
+    // Phase detection via monitor photodiode
+    reg [11:0] current_phase;
+    reg [11:0] error_integral;
+    reg [11:0] last_error;
+    
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            heater_pwm <= 8'h00;
+            phase_locked <= 1'b0;
+            error_integral <= 12'h000;
+            last_error <= 12'h000;
+        end else begin
+            // PID Calculation
+            reg [11:0] error = target_phase - current_phase;
+            reg [19:0] p_term = KP * error;
+            reg [19:0] i_term = KI * error_integral;
+            reg [19:0] d_term = KD * (error - last_error);
+            
+            reg [19:0] pid_output = p_term + i_term + d_term;
+            heater_pwm <= pid_output[19:12];  // Scale to 8-bit PWM
+            
+            // Update integral term with anti-windup
+            if (error_integral < 12'hFFF && error > 12'h00)
+                error_integral <= error_integral + error;
+            
+            last_error <= error;
+            phase_locked <= (error < 12'h010);  // Locked if error < 0.25°
+        end
+    end
+endmodule
+```
+
+Thermal Design:
+
+· Each MZI phase shifter: 100μm × 10μm titanium nitride heater
+· Thermal isolation: 5μm oxide trenches around each heater
+· Temperature coefficient: 0.1°C/mW phase shift
+· Control bandwidth: 100 kHz per heater
+· Phase resolution: 0.022° (12-bit effective)
+· Crosstalk between adjacent MZIs: <1% at 10μm spacing
+
+2.4 Electronic Control Chiplet
+
+Architecture:
+
+· RISC-V based control processor (4 cores @ 1.5GHz)
+· 64MB SRAM weight buffer (8 banks, 256-bit wide)
+· 8x 12-bit DAC arrays (64 channels each, 1 GSps)
+· Calibration engine with hardware acceleration
+· PCIe Gen5 x16 interface
+
+Memory Hierarchy:
+
+```
+┌─────────────────────────────────────────────────────┐
+│               MEMORY HIERARCHY                      │
+├─────────────────┬─────────────────┬─────────────────┤
+│ HBM3 (Off-chip) │ SRAM Weight     │ Register File   │
+│ 4x 8GB          │ Buffer 64MB     │ (512×256b)      │
+│ 819 GB/s BW     │ 1 TB/s BW       │ 4 TB/s BW       │
+├─────────────────┼─────────────────┼─────────────────┤
+│ DDR Controllers │ 8 SRAM Banks    │ Vector Regs     │
+│ (4x)            │ 256b @ 2GHz     │ (MAC operands)  │
+└─────────────────┴─────────────────┴─────────────────┘
+```
+
+2.5 Activation Chiplet
+
+Mixed-Signal Activation Unit:
+
+```
+┌─────────────────────────────────────────────────────┐
+│             ACTIVATION CHIPLET (4×4 Array)          │
+├──────────┬──────────┬──────────┬──────────┬─────────┤
+│ ADC      │ Digital  │ Non-     │ Normal-  │ Output  │
+│ Array    │ Gain     │ Linear   │ ization  │ Buffer  │
+│ 64ch     │ Control  │ Function │ Engine   │         │
+│ 8b@20GSps│ (0.25dB  │ (ReLU,   │ (Layer   │ 256b    │
+│          │ steps)   │ GELU,    │ Norm)    │ FIFO    │
+│          │          │ SiLU)    │          │         │
+└──────────┴──────────┴──────────┴──────────┴─────────┘
+```
+
+Analog ReLU Implementation:
+
+```verilog
+module analog_relu #(
+    parameter BITWIDTH = 8
+)(
+    input wire signed [BITWIDTH-1:0] data_in,
+    input wire clk,
+    output reg signed [BITWIDTH-1:0] data_out
+);
+    
+    // Analog-domain comparison (power-efficient)
+    wire is_negative = data_in[BITWIDTH-1];  // Sign bit
+    
+    always @(posedge clk) begin
+        if (is_negative)
+            data_out <= {BITWIDTH{1'b0}};  // Zero output
+        else
+            data_out <= data_in;            // Pass-through
+    end
+    
+    // Optional: Leaky ReLU with configurable alpha
+    parameter ALPHA = 4'h1;  // α = 0.0625 (1/16)
+    reg signed [BITWIDTH-1:0] leaky_output;
+    
+    always @(posedge clk) begin
+        if (is_negative)
+            // Right shift for multiplication by alpha
+            leaky_output <= {data_in[BITWIDTH-1], data_in[BITWIDTH-2:4]};
+        else
+            leaky_output <= data_in;
+    end
+endmodule
+```
+
+---
+
+3. OPTICAL DESIGN AND IMPLEMENTATION
+
+3.1 Wavelength Plan
+
+64-Channel WDM Scheme:
+
+```
+Channel   λ (nm)     Channel   λ (nm)     Channel   λ (nm)
+  1       1545.32      23      1549.72      45      1554.12
+  2       1545.72      24      1550.12      46      1554.52
+  ...       ...        ...       ...        ...       ...
+  22      1549.32      44      1553.72      64      1556.92
+
+Grid: 400 GHz spacing (3.2 nm in C-band)
+Source: 4× external cavity lasers @ 16λ each
+Power per channel: +3 dBm (2 mW)
+Total optical power: 128 mW
+```
+
+3.2 Optical Power Budget
+
+```
+Component                  Loss (dB)   Cumulative (dB)
+─────────────────────────────────────────────────────
+Laser output                     0.0            0.0
+Fiber-to-chip coupling          -3.0           -3.0
+Waveguide propagation          -1.0           -4.0
+Modulator insertion           -3.0           -7.0
+MZI mesh (64 stages)         -12.0          -19.0
+Output coupling               -3.0          -22.0
+Photodetector sensitivity     -20.0          -42.0
+─────────────────────────────────────────────────────
+Margin                        +3.0           -39.0
+Required for 8-bit SNR       -36.0           
+─────────────────────────────────────────────────────
+Status: ✓ (3 dB margin)
+```
+
+3.3 Photodetector Design
+
+Germanium-on-Silicon Photodiode:
+
+· Area: 5μm × 10μm
+· Responsivity: 0.8 A/W @ 1550nm
+· Bandwidth: 50 GHz
+· Dark current: 100 nA
+· Capacitance: 5 fF
+· Integrated TIA: 50Ω, 40 dB gain
+
+Noise Analysis:
+
+```
+Noise Source                  Power (nA/√Hz)
+────────────────────────────────────────────
+Shot noise (Pin = -20 dBm)         0.12
+Thermal noise (TIA)                0.18
+Dark current noise                 0.02
+────────────────────────────────────────────
+Total input-referred noise         0.22 nA/√Hz
+Signal current (8-bit LSB)         1.56 nA
+SNR (for 20 GHz BW)                37 dB (≈6 bits)
+────────────────────────────────────────────
+After averaging (64 samples)      43 dB (≈7 bits)
+```
+
+---
+
+4. CALIBRATION SYSTEM ARCHITECTURE
+
+4.1 Multi-Stage Calibration Pipeline
+
+```
+┌─────────────────────────────────────────────────────┐
+│             CALIBRATION CONTROLLER                  │
+├─────────────────────────────────────────────────────┤
+│ Phase 1: Factory Calibration                        │
+│   • Laser wavelength characterization               │
+│   • MZI phase response mapping                     │
+│   • Photodetector linearity calibration            │
+│   • Thermal coefficient measurement                │
+│   → Stores in NVM                                  │
+├─────────────────────────────────────────────────────┤
+│ Phase 2: Power-On Calibration (10ms)               │
+│   • Laser lock to ITU grid                         │
+│   • Phase shifter linearization                    │
+│   • Baseline offset nulling                        │
+│   → Loads to SRAM LUTs                             │
+├─────────────────────────────────────────────────────┤
+│ Phase 3: Runtime Background Calibration            │
+│   • Continuous temperature monitoring              │
+│   • Drift compensation (1 kHz update)              │
+│   • Error detection and correction                 │
+│   → Updates calibration registers                  │
+└─────────────────────────────────────────────────────┘
+```
+
+4.2 MZI Mesh Calibration Algorithm
+
+```python
+class MZI_Mesh_Calibrator:
+    def __init__(self, num_layers, num_mzis_per_layer):
+        self.num_layers = num_layers
+        self.num_mzis = num_mzis_per_layer
+        self.phase_LUT = np.zeros((num_layers, num_mzis_per_layer, 256))
+        self.temp_coeff = np.zeros((num_layers, num_mzis_per_layer))
+        
+    def calibrate_mzi(self, layer_idx, mzi_idx, monitor_pd):
+        """Calibrate single MZI using monitor photodiode"""
+        voltages = np.linspace(0, 3.3, 256)  # 8-bit DAC range
+        transmissions = []
+        
+        for v in voltages:
+            apply_voltage(mzi_idx, v)
+            time.sleep(10e-6)  # Thermal settling
+            transmissions.append(monitor_pd.read())
+        
+        # Find Vπ (voltage for π phase shift)
+        # Transmission minima correspond to π phase difference
+        minima_indices = argrelextrema(np.array(transmissions), np.less)[0]
+        if len(minima_indices) >= 2:
+            v_pi = voltages[minima_indices[1]] - voltages[minima_indices[0]]
+        else:
+            v_pi = 1.65  # Default
+        
+        # Build linearization LUT
+        phase = np.arccos(np.sqrt(transmissions)) * 2
+        self.phase_LUT[layer_idx, mzi_idx] = np.interp(
+            np.linspace(0, np.pi, 256),
+            phase, voltages
+        )
+        
+        # Measure thermal coefficient
+        self.measure_thermal_coeff(layer_idx, mzi_idx)
+        
+    def parallel_calibration(self, test_vectors):
+        """Parallel calibration using orthogonal test patterns"""
+        # Use Hadamard patterns for parallel calibration
+        H = hadamard(self.num_mzis)
+        
+        for pattern_idx in range(self.num_mzis):
+            # Apply Hadamard pattern
+            pattern = H[pattern_idx]
+            apply_pattern_to_mesh(pattern)
+            
+            # Measure all outputs simultaneously
+            outputs = read_all_detectors()
+            
+            # Update calibration based on expected vs measured
+            self.update_calibration_weights(pattern, outputs)
+```
+
+4.3 Digital Pre-Distortion
+
+To compensate for MZI non-linearity:
+
+```verilog
+module phase_shifter_predistort #(
+    parameter LUT_DEPTH = 256,
+    parameter PHASE_BITS = 12
+)(
+    input wire [PHASE_BITS-1:0] target_phase,
+    input wire [7:0] temperature,  // 0-255°C scaled
+    output reg [7:0] heater_voltage
+);
+    
+    // Triple LUT: phase × temperature → voltage
+    reg [7:0] phase_lut [0:LUT_DEPTH-1][0:255];
+    reg [7:0] temp_comp_lut [0:255];
+    
+    always @(*) begin
+        // Address calculation
+        wire [7:0] phase_index = target_phase[PHASE_BITS-1:PHASE_BITS-8];
+        wire [7:0] temp_index = temperature;
+        
+        // Base voltage from phase LUT
+        reg [7:0] base_voltage = phase_lut[phase_index][temp_index];
+        
+        // Fine adjustment (4 LSBs of phase)
+        wire [3:0] fine_phase = target_phase[3:0];
+        reg [7:0] fine_adjust = {4'b0, fine_phase};
+        
+        // Temperature compensation
+        reg [7:0] temp_comp = temp_comp_lut[temp_index];
+        
+        // Final output with saturation
+        heater_voltage = (base_voltage + fine_adjust + temp_comp) > 255 ? 
+                         255 : (base_voltage + fine_adjust + temp_comp);
+    end
+    
+    // LUT initialization from calibration
+    task load_calibration_data;
+        input [7:0] phase_data [0:LUT_DEPTH-1][0:255];
+        input [7:0] temp_data [0:255];
+        begin
+            phase_lut = phase_data;
+            temp_comp_lut = temp_data;
+        end
+    endtask
+endmodule
+```
+
+---
+
+5. SOFTWARE STACK AND PROGRAMMING MODEL
+
+5.1 Complete Software Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│          AI FRAMEWORKS (PyTorch/TensorFlow)        │
+├─────────────────────────────────────────────────────┤
+│   Photonic-Aware Model Optimizer & Quantizer       │
+│   • Matrix decomposition (SVD, Clements)           │
+│   • Noise-aware training                           │
+│   • Thermal-aware weight mapping                   │
+├─────────────────────────────────────────────────────┤
+│   PHOENIX Compiler & Runtime                       │
+│   • Weight decomposition to MZI parameters         │
+│   • Calibration schedule generation                │
+│   • Real-time thermal management                   │
+├─────────────────────────────────────────────────────┤
+│   Photonic Hardware Abstraction Layer (PHAL)       │
+│   • Device drivers (DAC/ADC control)               │
+│   • Calibration engine interface                   │
+│   • Error detection and recovery                   │
+├─────────────────────────────────────────────────────┤
+│   Firmware (RISC-V Bare Metal)                     │
+│   • Real-time phase control loops                  │
+│   • Hardware diagnostics                           │
+│   • Power management                               │
+└─────────────────────────────────────────────────────┘
+```
+
+5.2 Weight Decomposition Algorithm
+
+```python
+import numpy as np
+from scipy.linalg import svd, block_diag
+
+class PhotonicDecomposer:
+    def __init__(self, mesh_size=64, bitwidth=8):
+        self.N = mesh_size
+        self.bitwidth = bitwidth
+        self.mzi_layers = self.N  # Clements mesh depth
+        
+    def clements_decomposition(self, unitary_matrix):
+        """Decompose unitary matrix into MZI mesh parameters"""
+        U = unitary_matrix.copy()
+        N = self.N
+        
+        # Phase matrices for internal and external phases
+        theta = np.zeros((self.mzi_layers, N))
+        phi = np.zeros((self.mzi_layers, N))
+        
+        # Nullification pattern (Clements)
+        for col in range(N-1):
+            for row in range(N-2, col-1, -1):
+                if abs(U[row+1, col]) > 1e-10:
+                    # Calculate MZI parameters
+                    theta_val = 0.5 * np.arctan2(abs(U[row+1, col]), 
+                                                abs(U[row, col]))
+                    phi_val = np.angle(U[row+1, col]) - np.angle(U[row, col])
+                    
+                    # Store parameters
+                    layer_idx = N - 2 - row + col
+                    mzi_idx = col if (row % 2 == col % 2) else N-2-col
+                    
+                    theta[layer_idx, mzi_idx] = theta_val
+                    phi[layer_idx, mzi_idx] = phi_val
+                    
+                    # Apply Givens rotation
+                    G = self.givens_matrix(theta_val, phi_val)
+                    U[row:row+2, :] = G @ U[row:row+2, :]
+        
+        return theta, phi
+    
+    def svd_to_photonic(self, weight_matrix):
+        """Convert real weight matrix to photonic implementation"""
+        # SVD decomposition
+        U, S, Vh = svd(weight_matrix, full_matrices=False)
+        
+        # Diagonal matrix implementation
+        # S is implemented using amplitude modulators
+        # or additional phase shifters
+        
+        # For coherent processing, need unitary matrices
+        U_uni = self.make_unitary(U)
+        V_uni = self.make_unitary(Vh.conj().T)
+        
+        # Decompose unitary matrices
+        theta_U, phi_U = self.clements_decomposition(U_uni)
+        theta_V, phi_V = self.clements_decomposition(V_uni)
+        
+        # Quantize for hardware
+        theta_U_q = self.quantize_phases(theta_U)
+        phi_U_q = self.quantize_phases(phi_U)
+        theta_V_q = self.quantize_phases(theta_V)
+        phi_V_q = self.quantize_phases(phi_V)
+        
+        return {
+            'theta_U': theta_U_q,
+            'phi_U': phi_U_q,
+            'theta_V': theta_V_q,
+            'phi_V': phi_V_q,
+            'singular_values': S
+        }
+    
+    def quantize_phases(self, phases, bits=12):
+        """Quantize phase values to hardware resolution"""
+        scale = (2**bits) / (2 * np.pi)
+        quantized = np.round(phases * scale).astype(int)
+        # Wrap to [0, 2^bits-1]
+        quantized = quantized % (2**bits)
+        return quantized
+```
+
+5.3 Runtime Scheduling
+
+```cpp
+class PhotonicScheduler {
+private:
+    std::vector<LayerConfig> layer_queue;
+    ThermalManager thermal_mgr;
+    CalibrationEngine cal_engine;
+    
+public:
+    void schedule_layer(LayerConfig layer) {
+        // Check thermal constraints
+        if (!thermal_mgr.can_accept_layer(layer.power_estimate)) {
+            thermal_mgr.throttle();
+        }
+        
+        // Pre-calibration for critical MZIs
+        cal_engine.pre_calibrate(layer.mzi_indices);
+        
+        // Schedule execution
+        execute_photonic_layer(layer);
+        
+        // Post-calibration and thermal update
+        cal_engine.background_calibration();
+        thermal_mgr.update_power_model(layer.actual_power);
+    }
+    
+    void execute_photonic_layer(LayerConfig layer) {
+        // 1. Load weights to MZI mesh
+        for (auto& mzi : layer.mzi_configs) {
+            set_mzi_phase(mzi.id, mzi.theta, mzi.phi);
+        }
+        
+        // 2. Stream inputs through pipeline
+        for (int batch = 0; batch < layer.batch_size; batch += 64) {
+            // Load input batch (64 vectors via WDM)
+            load_input_batch(layer.inputs, batch, 64);
+            
+            // Fire laser and process
+            enable_lasers();
+            
+            // Wait for optical propagation (~100ps)
+            std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+            
+            // Read outputs
+            auto outputs = read_detector_array();
+            
+            // Apply activation (electronic)
+            auto activated = apply_activation(outputs, layer.activation);
+            
+            // Store for next layer or output
+            store_results(activated, layer.output_buffer);
+        }
+    }
+};
+```
+
+---
+
+6. ERROR CORRECTION AND FAULT TOLERANCE
+
+6.1 Multi-Level Error Handling
+
+Level 1: Hardware Redundancy
+
+· 5% spare MZIs per mesh (204 spare out of 4096)
+· Dynamic rerouting around faulty MZIs
+· Dual-redundant laser sources with automatic switchover
+
+Level 2: Error Detection Codes
+
+```verilog
+module photonic_error_detection #(
+    parameter DATA_WIDTH = 64,
+    parameter ECC_BITS = 8
+)(
+    input wire [DATA_WIDTH-1:0] data_in,
+    input wire [ECC_BITS-1:0] ecc_in,
+    output wire [DATA_WIDTH-1:0] data_out,
+    output wire error_flag,
+    output wire [ECC_BITS-1:0] ecc_out
+);
+    
+    // Calculate Hamming code for 64-bit data
+    function [ECC_BITS-1:0] calculate_ecc;
+        input [DATA_WIDTH-1:0] data;
+        reg [ECC_BITS-1:0] ecc;
+        begin
+            ecc[0] = ^(data & 64'h5555555555555555);
+            ecc[1] = ^(data & 64'h3333333333333333);
+            ecc[2] = ^(data & 64'h0F0F0F0F0F0F0F0F);
+            ecc[3] = ^(data & 64'h00FF00FF00FF00FF);
+            ecc[4] = ^(data & 64'h0000FFFF0000FFFF);
+            ecc[5] = ^(data & 64'h00000000FFFFFFFF);
+            ecc[6] = ^(data & 64'hFFFFFFFF00000000);
+            ecc[7] = ^(data & 64'h0000000000000000); // Reserved
+            calculate_ecc = ecc;
+        end
+    endfunction
+    
+    // Syndrome calculation
+    wire [ECC_BITS-2:0] syndrome = calculate_ecc(data_in) ^ ecc_in;
+    
+    // Single error correction
+    reg [DATA_WIDTH-1:0] corrected_data;
+    always @(*) begin
+        corrected_data = data_in;
+        if (syndrome != 0) begin
+            // Flip the erroneous bit
+            if (syndrome < DATA_WIDTH) begin
+                corrected_data[syndrome] = ~corrected_data[syndrome];
+            end
+        end
+    end
+    
+    assign data_out = corrected_data;
+    assign error_flag = (syndrome != 0);
+    assign ecc_out = calculate_ecc(corrected_data);
+endmodule
+```
+
+Level 3: Algorithmic Error Mitigation
+
+· Noise-aware training with photonic noise models
+· Error-resilient neural architectures
+· Majority voting across multiple WDM channels
+
+---
+
+7. POWER MANAGEMENT ARCHITECTURE
+
+7.1 Dynamic Power Gating
+
+Power Domains:
+
+```
+Domain              Voltage     Clock       Leakage     Active Power
+────────────────────────────────────────────────────────────────────
+Lasers (4x)         2.5V        N/A         0W          4×200mW
+MZI Heaters         1.8V        100kHz      50mW        2W peak
+Modulators          1.2V        50GHz       20mW        800mW
+Detectors+TIAs      1.0V        20GHz       30mW        400mW
+Digital Control     0.8V        1.5GHz      100mW       1.2W
+Memory (SRAM)       0.9V        2GHz        200mW       1.5W
+────────────────────────────────────────────────────────────────────
+Total (Active)                                    ~6.5W
+Total (Idle)                                      ~400mW
+```
+
+7.2 Thermal-Aware Scheduling
+
+```cpp
+class ThermalAwareScheduler {
+private:
+    std::vector<TemperatureSensor> sensors;
+    std::vector<PowerDomain> domains;
+    ThermalModel model;
+    
+public:
+    void schedule_with_thermal_constraints(Task task) {
+        // Predict temperature rise
+        float predicted_temp = model.predict(
+            current_temperatures(),
+            task.power_profile,
+            task.duration
+        );
+        
+        // Check constraints
+        if (predicted_temp > 85.0) {  // Max junction temperature
+            // Apply throttling
+            float scale_factor = 85.0 / predicted_temp;
+            task.throttle(scale_factor);
+            
+            // Schedule cooling period
+            schedule_cooling_cycle(task.duration * 0.1);
+        }
+        
+        // Execute with thermal monitoring
+        execute_with_monitoring(task);
+    }
+    
+    void dynamic_voltage_frequency_scaling() {
+        // Monitor workload and adjust
+        float utilization = get_core_utilization();
+        
+        if (utilization < 0.3) {
+            set_frequency(0.5, GHz);
+            set_voltage(0.7, V);
+        } else if (utilization < 0.7) {
+            set_frequency(1.0, GHz);
+            set_voltage(0.8, V);
+        } else {
+            set_frequency(1.5, GHz);
+            set_voltage(0.9, V);
+        }
+    }
+};
+```
+
+---
+
+8. PERFORMANCE MODELING AND VALIDATION
+
+8.1 Performance Simulation Framework
+
+```python
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class PhotonicCoreParams:
+    n_mzis: int = 4096
+    n_wavelengths: int = 64
+    modulator_rate: float = 50e9  # 50 Gbps
+    adc_bits: int = 8
+    adc_rate: float = 20e9  # 20 GSps
+    phase_resolution: int = 12  # bits
+    v_pi: float = 1.65  # volts
+    thermal_time_const: float = 100e-6  # seconds
+    
+class PerformanceModel:
+    def __init__(self, params: PhotonicCoreParams):
+        self.params = params
+        
+    def compute_throughput(self, batch_size=64):
+        """Compute throughput in TOPS"""
+        # Operations per vector multiplication
+        ops_per_vector = 2 * self.params.n_mzis  # MAC operations
+        
+        # Time per vector (limited by optical propagation)
+        optical_delay = 100e-12  # 100ps
+        
+        # Effective clock rate
+        effective_rate = min(
+            1/optical_delay,
+            self.params.modulator_rate
+        )
+        
+        # Parallelism from WDM
+        parallel_vectors = self.params.n_wavelengths
+        
+        # Throughput
+        throughput = (ops_per_vector * effective_rate * 
+                     parallel_vectors * batch_size)
+        
+        return throughput / 1e12  # Convert to TOPS
+    
+    def compute_energy_efficiency(self):
+        """Compute energy efficiency in TOPS/W"""
+        # Energy components (per MAC)
+        laser_energy = 2e-12  # 2 pJ/MAC (shared across WDM)
+        modulator_energy = 50e-15  # 50 fJ/MAC
+        detector_energy = 100e-15  # 100 fJ/MAC
+        phase_shifter_energy = 10e-15  # 10 fJ/MAC (tuning)
+        
+        total_energy_per_mac = (laser_energy + modulator_energy + 
+                               detector_energy + phase_shifter_energy)
+        
+        # Throughput from previous calculation
+        throughput_tops = self.compute_throughput()
+        
+        # Power = Energy × Throughput
+        power = total_energy_per_mac * throughput_tops * 1e12
+        
+        # Efficiency
+        efficiency = throughput_tops / (power / 1e12)  # TOPS/W
+        
+        return efficiency, power
+
+# Example usage
+params = PhotonicCoreParams()
+model = PerformanceModel(params)
+throughput = model.compute_throughput()
+efficiency, power = model.compute_energy_efficiency()
+
+print(f"Throughput: {throughput:.2f} TOPS")
+print(f"Energy Efficiency: {efficiency:.0f} TOPS/W")
+print(f"Total Power: {power:.2f} W")
+```
+
+8.2 Validation Test Suite
+
+```python
+class PhotonicAcceleratorTestSuite:
+    def __init__(self, accelerator):
+        self.acc = accelerator
+        
+    def run_comprehensive_test(self):
+        results = {}
+        
+        # 1. Functional test
+        results['functional'] = self.test_matrix_multiplication()
+        
+        # 2. Precision test
+        results['precision'] = self.test_precision_sweep()
+        
+        # 3. Noise test
+        results['noise'] = self.test_noise_immunity()
+        
+        # 4. Thermal test
+        results['thermal'] = self.test_thermal_stability()
+        
+        # 5. Calibration test
+        results['calibration'] = self.test_calibration_accuracy()
+        
+        return results
+    
+    def test_matrix_multiplication(self):
+        """Test with known matrices"""
+        # Generate random unitary matrix
+        A = np.random.randn(64, 64) + 1j * np.random.randn(64, 64)
+        Q, R = np.linalg.qr(A)
+        unitary_matrix = Q
+        
+        # Generate random input vector
+        x = np.random.randn(64) + 1j * np.random.randn(64)
+        
+        # Expected result
+        y_expected = unitary_matrix @ x
+        
+        # Program accelerator
+        self.acc.program_matrix(unitary_matrix)
+        
+        # Run on accelerator
+        y_actual = self.acc.compute(x)
+        
+        # Calculate error
+        error = np.linalg.norm(y_expected - y_actual) / np.linalg.norm(y_expected)
+        
+        return {
+            'max_error': np.max(np.abs(y_expected - y_actual)),
+            'relative_error': error,
+            'snr': 20 * np.log10(np.linalg.norm(y_expected) / 
+                                 np.linalg.norm(y_expected - y_actual))
+        }
+```
+
+---
+
+9. FABRICATION FLOW AND INTEGRATION
+
+9.1 Multi-Chiplet Fabrication Flow
+
+```
+Step 1: Photonic Wafer Fabrication (SOI Platform)
+  1. SOI substrate preparation (220nm Si on 2μm SiO₂)
+  2. Waveguide patterning (193nm DUV lithography)
+  3. Germanium epitaxy for photodetectors
+  4. SiN deposition for low-loss waveguides
+  5. TiN heater deposition and patterning
+  6. SiO₂ cladding deposition and planarization
+  7. Grating coupler formation
+  8. Through-silicon via (TSV) etching
+  9. Wafer thinning and CMP
+
+Step 2: Electronic Wafer Fabrication (7nm CMOS)
+  1. Standard CMOS front-end processing
+  2. Cu BEOL interconnect formation
+  3. Micro-bump formation (25μm pitch)
+  4. Wafer probing and testing
+
+Step 3: 2.5D Integration
+  1. Photonic and electronic wafer dicing
+  2. Die placement on silicon interposer
+  3. Thermo-compression bonding
+  4. Underfill dispensing and curing
+  5. Interposer-to-package substrate bonding
+  6. HBM memory stacking
+  7. Lid attachment with TIM
+  8. Final test and burn-in
+```
+
+9.2 Yield Analysis and Redundancy
+
+Component Yield Models:
+
+```
+Component               Yield per unit   Redundancy   Effective Yield
+─────────────────────────────────────────────────────────────────────
+MZI Phase Shifter         99.5%          5% spare     99.997%
+Waveguide (per mm)        99.99%         N/A          99.99%
+Modulator                 98%            2% spare     99.96%
+Photodetector             97%            3% spare     99.91%
+Laser (external)          99.9%          Dual         99.9999%
+─────────────────────────────────────────────────────────────────────
+Overall Chip Yield (4096 MZI):           ~85%
+With redundancy and repair:              ~95%
+```
+
+---
+
+10. DEPLOYMENT AND SCALING
+
+10.1 Rack-Scale Deployment
+
+Phoenix Rack Architecture:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  STANDARD 42U RACK                  │
+├─────────────────────────────────────────────────────┤
+│ Top of Rack Switch (100G Ethernet/InfiniBand)       │
+├─────────────────────────────────────────────────────┤
+│ 20× Phoenix Server Blades                           │
+│   • 4× Phoenix Accelerator Cards per blade          │
+│   • Dual Xeon Gold Host Processors                  │
+│   • 512GB DDR5 RAM                                  │
+│   • 2× 100G NICs                                    │
+├─────────────────────────────────────────────────────┤
+│ Centralized Laser Bank (19" chassis)                │
+│   • 80× tunable lasers                              │
+│   • Optical power monitoring                        │
+│   • Redundant power supplies                        │
+├─────────────────────────────────────────────────────┤
+│ Optical Distribution Panel                          │
+│   • M×N fiber array connectors                      │
+│   • Optical power splitters                         │
+│   • Wavelength multiplexers                         │
+└─────────────────────────────────────────────────────┘
+
+Total Rack Performance:
+• 20 blades × 4 cards × 256 TOPS = 20,480 TOPS
+• Power: 20× 300W = 6kW + overhead ≈ 10kW/rack
+• Performance Density: 2,048 TOPS/U
+• Energy Efficiency: 2.0 TOPS/W (system level)
+```
+
+10.2 Multi-Rack Optical Interconnect
+
+For scaling beyond single rack:
+
+```python
+class OpticalFabricNetwork:
+    def __init__(self, num_racks, topology='dragonfly'):
+        self.num_racks = num_racks
+        self.topology = topology
+        self.optical_switches = []
+        
+    def configure_all_to_all(self):
+        """Configure all-to-all connectivity for collective operations"""
+        # Each rack gets subset of model layers
+        for rack_id in range(self.num_racks):
+            # Program optical switches for this rack's fan-out
+            self.configure_rack_fanout(rack_id)
+            
+    def allreduce_photonic(self, gradients):
+        """Perform all-reduce using photonic summation"""
+        # Each rack modulates gradients onto optical carriers
+        modulated_signals = []
+        for rack in self.racks:
+            signal = rack.modulate_data(gradients[rack.id])
+            modulated_signals.append(signal)
+        
+        # Passive optical combiner sums all signals
+        combined = optical_combine(modulated_signals)
+        
+        # Each rack detects the sum
+        total_gradient = []
+        for rack in self.racks:
+            detected = rack.detect_signal(combined)
+            total_gradient.append(detected)
+        
+        return np.mean(total_gradient, axis=0)
+```
+
+---
+
+CONCLUSION AND FUTURE DIRECTIONS
+
+Key Innovations in This Architecture:
+
+1. Heterogeneous 2.5D Integration - CMOS + photonics with optimized thermal design
+2. WDM-enhanced Parallelism - 64× throughput multiplication
+3. Multi-level Calibration - From factory to runtime background calibration
+4. Error-Resilient Design - Hardware redundancy + algorithmic error correction
+5. Thermal-Aware Scheduling - Dynamic management of photonic phase stability
+
+Immediate Next Steps (12-18 months):
+
+1. Tape-out of test chip with 16×16 MZI mesh
+2. Software stack maturation with PyTorch/TensorFlow integration
+3. Reliability testing under data center conditions
+4. Scalability demonstration with multi-chiplet operation
+
+Long-term Evolution:
+
+1. 3D photonic integration with multiple waveguide layers
+2. Non-linear photonic activation for all-optical neural networks
+3. Quantum photonic co-processors for specific algorithms
+4. Wafer-scale photonic systems with optical power delivery
+
+This architecture represents a practical, manufacturable path to photonic computing that addresses the key challenges of precision, thermal management, and integration while delivering order-of-magnitude improvements in energy efficiency for AI inference workloads.
